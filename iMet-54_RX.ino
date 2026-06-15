@@ -1,7 +1,7 @@
 
 /*
- * iMet-54 Receiver / Decoder  —  ESP32 + CC1101  (v3.0 - fully audited)
- * =======================================================================
+ * iMet-54 Receiver / Decoder  —  ESP32 + CC1101 
+
  * WiFi AP:  SSID "iMet54-RX"  /  password "imet1234"
  * Open:     http://192.168.4.1
  *
