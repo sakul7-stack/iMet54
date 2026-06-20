@@ -88,10 +88,27 @@ static volatile uint8_t  ring[RING_SIZE];
 static volatile uint32_t ring_wr = 0;
 static volatile uint32_t ring_rd = 0;
 
-// Globals 
+// Globals
 float rxFreq  = 402.000f;
 bool  rxActive = false;
 volatile bool isrAttached = false;
+
+// Auto-calibration (frequency sweep) + polarity
+// Sonde center drifts ~±15 kHz. We hop across these offsets (kHz) around the
+// user-selected base freq until a CRC-valid frame decodes, then lock.
+// On-chip FOCCFG handles the residual fine offset within each step.
+static const float CAL_OFFS_KHZ[] = {
+    0.0f, -2.0f, +5.0f, -7.0f, +10.0f, -12.0f, +15.0f, -15.0f
+};
+static const int CAL_N = sizeof(CAL_OFFS_KHZ) / sizeof(CAL_OFFS_KHZ[0]);
+static float             calBase     = 402.000f; // user-chosen center
+static volatile bool     autoCal     = true;     // sweeping for a lock
+static int               calIdx      = 0;
+static volatile uint32_t lastFrameMs = 0;        // millis() of last decoded frame
+static uint32_t          lastHopMs   = 0;
+static volatile bool     lastInvert  = false;    // polarity of last good sync
+#define CAL_HOP_MS     1600   // dwell per candidate while searching
+#define CAL_NOFRAME_MS 5000   // resume hopping after this gap with no frames
 
 Preferences prefs;
 WebServer   server(80);
@@ -274,10 +291,16 @@ static float vaporSatP(float tc) {
                     - 4.8640239e-2*T + 4.1764768e-5*T*T - 1.4452093e-8*T*T*T);
 }
 
-// ── Sync word correlator 
-static int sync_score(const uint8_t *bits) {
+// ── Sync word correlator
+// Scores against the sync pattern. If invert!=0, the incoming bits are
+// treated as inverted (FSK tone-sense flipped) — matches reference --invert.
+static int sync_score(const uint8_t *bits, bool invert) {
     int s = 0;
-    for (int i = 0; i < SYNCLEN; i++) s += (bits[i] == SYNC_BITS[i]);
+    if (!invert) {
+        for (int i = 0; i < SYNCLEN; i++) s += (bits[i] == SYNC_BITS[i]);
+    } else {
+        for (int i = 0; i < SYNCLEN; i++) s += ((bits[i] ^ 1) == SYNC_BITS[i]);
+    }
     return s;
 }
 
@@ -291,17 +314,18 @@ static int sync_score(const uint8_t *bits) {
 //   3. Hamming decode: 216 codewords → 216 nibbles → 108 bytes
 //   4. CRC check
 //   5. Parse fields
-static bool decode_frame(const uint8_t *raw_bits, DecodedFrame *out) {
+static bool decode_frame(const uint8_t *raw_bits, DecodedFrame *out, bool invert) {
 
     // STEP 1: De-8N1
     // Each 10-bit 8N1 symbol: bit[0]=start, bit[1..8]=data LSB-first, bit[9]=stop
     // Take positions where (i % 10) is in {1..8}, skip 0 (start) and 9 (stop)
     // 2160 input → 1728 output  (27 blocks × 64 encoded bits)
+    // invert: flip FSK bit-sense (matches reference --invert) before decode.
     static uint8_t enc_bits[1728];
     int nb = 0;
     for (int i = 0; i < FRAME_RAW_BITS + SEARCH_MARGIN && nb < 1728; i++) {
         int r = i % 10;
-        if (r >= 1 && r <= 8) enc_bits[nb++] = raw_bits[i];
+        if (r >= 1 && r <= 8) enc_bits[nb++] = invert ? (raw_bits[i] ^ 1) : raw_bits[i];
     }
     if (nb < 1728) return false;
 
@@ -440,14 +464,29 @@ static void decode_task(void *) {
 
         bool found = false;
         for (int i = 0; i <= sbuf_len - SYNCLEN - FRAME_RAW_BITS; i++) {
-            if (sync_score(sbuf + i) >= 46) {   // 46/50 allows up to 4 bit errors in sync
+            // Try normal polarity first, then inverted (FSK tone-sense flip).
+            // Prefer last-known-good polarity to lock faster once synced.
+            bool polA = lastInvert, polB = !lastInvert;
+            bool hit = false, usedInv = false;
+            if (sync_score(sbuf + i, polA) >= 46) { hit = true; usedInv = polA; }
+            else if (sync_score(sbuf + i, polB) >= 46) { hit = true; usedInv = polB; }
+
+            if (hit) {   // 46/50 allows up to 4 bit errors in sync
                 DecodedFrame fr;
                 memset(&fr, 0, sizeof(fr));
-                if (decode_frame(sbuf + i + SYNCLEN, &fr)) {
+                if (decode_frame(sbuf + i + SYNCLEN, &fr, usedInv)) {
+                    // Always show the frame on the page (badged by CRC state) so
+                    // the user sees ~1 frame/sec. But only LOCK the auto-cal sweep
+                    // on a CRC-valid frame — noise must not stop the sweep.
+                    if (fr.crc_ok) {
+                        lastInvert  = usedInv;
+                        lastFrameMs = millis();
+                        autoCal     = false;   // lock onto this freq + polarity
+                    }
                     xSemaphoreTake(frame_mutex, portMAX_DELAY);
                     frames[frame_head] = fr;
                     frame_head  = (frame_head + 1) % MAX_FRAMES;
-                    frame_total++;           // never capped — used for SSE push tracking
+                    frame_total++;             // never capped — used for SSE push tracking
                     xSemaphoreGive(frame_mutex);
                 }
                 // Consume everything up to and including this frame
@@ -485,7 +524,8 @@ void setupCC1101RX() {
     ELECHOUSE_cc1101.SpiWriteReg(0x08, 0x12);
     // FSCTRL1: IF frequency ~101 kHz
     ELECHOUSE_cc1101.SpiWriteReg(0x0B, 0x06);
-    // MDMCFG4: channel BW = 101.5625 kHz
+    // MDMCFG4: channel BW ~58 kHz (CHANBW_E=3,M=3). Wide enough that FOCCFG's
+    // ±BW/4 (~14.5 kHz) offset-compensation range covers the sonde's drift.
     ELECHOUSE_cc1101.SpiWriteReg(0x10, 0xF7);
     // MDMCFG3: data rate mantissa → ~4800 baud
     ELECHOUSE_cc1101.SpiWriteReg(0x11, 0x83);
@@ -501,10 +541,18 @@ void setupCC1101RX() {
     ELECHOUSE_cc1101.SpiWriteReg(0x17, 0x3F);
     // MCSM0: auto-calibrate when transitioning from IDLE to RX
     ELECHOUSE_cc1101.SpiWriteReg(0x18, 0x18);
+    // FOCCFG: frequency-offset compensation ON, wide pre-sync range
+    // (FOC_BS_CS_GATE=0, FOC_PRE_K=3, FOC_POST_K=1, FOC_LIMIT=2 → ±BW/4)
+    // This is the key fix for carrier drift across 401.985..402.005 MHz.
+    ELECHOUSE_cc1101.SpiWriteReg(0x19, 0x36);
+    // BSCFG: bit-synchronizer — wider clock-recovery range for baud tolerance
+    ELECHOUSE_cc1101.SpiWriteReg(0x1A, 0x6C);
     // AGCCTRL2/1/0: tuned for GFSK narrow-band
     ELECHOUSE_cc1101.SpiWriteReg(0x1B, 0x43);
     ELECHOUSE_cc1101.SpiWriteReg(0x1C, 0x40);
     ELECHOUSE_cc1101.SpiWriteReg(0x1D, 0x91);
+    // FSCTRL0: zero starting freq offset (FOC will adjust from here)
+    ELECHOUSE_cc1101.SpiWriteReg(0x0C, 0x00);
 
     pinMode(PIN_GDO0, INPUT);
     pinMode(PIN_GDO2, INPUT);
@@ -526,7 +574,12 @@ static void enterRX(float freqMHz) {
     attachInterrupt(digitalPinToInterrupt(PIN_GDO2), rx_isr, RISING);
     isrAttached = true;
     rxActive = true;
-    Serial.printf("RX started on %.3f MHz\n", freqMHz);
+    calBase     = freqMHz;         // sweep ±15 kHz around the chosen freq
+    calIdx      = 0;
+    autoCal     = true;            // start sweeping for a fresh lock
+    lastFrameMs = millis();
+    lastHopMs   = millis();
+    Serial.printf("RX started on %.3f MHz (auto-cal sweeping)\n", freqMHz);
 }
 
 static void exitRX() {
@@ -540,6 +593,42 @@ static void exitRX() {
 }
 
 static int8_t readRSSI() { return (int8_t)ELECHOUSE_cc1101.getRssi(); }
+
+// Lightweight retune used by the auto-cal sweep (keeps RX/ISR running).
+static void retune(float freqMHz) {
+    ELECHOUSE_cc1101.SpiStrobe(0x36); delayMicroseconds(200);  // SIDLE
+    ELECHOUSE_cc1101.setMHZ(freqMHz);
+    ELECHOUSE_cc1101.SpiStrobe(0x34);                          // SRX (auto-recal via MCSM0)
+    ring_wr = ring_rd = 0;
+    sbuf_len = 0;
+}
+
+// Called from loop(): hop across candidate freqs until a CRC-valid frame
+// locks (autoCal=false). If frames stop arriving, resume hopping.
+static void service_autocal() {
+    if (!rxActive || scanRunning) return;
+    uint32_t now = millis();
+
+    if (!autoCal) {
+        // Locked. If we lose the signal for too long, start sweeping again.
+        if (now - lastFrameMs > CAL_NOFRAME_MS) {
+            autoCal   = true;
+            lastHopMs = now;
+            Serial.println("Signal lost — resuming auto-cal sweep");
+        }
+        return;
+    }
+
+    // Sweeping: dwell CAL_HOP_MS on each candidate, then hop.
+    if (now - lastHopMs >= CAL_HOP_MS) {
+        calIdx = (calIdx + 1) % CAL_N;
+        float f = calBase + CAL_OFFS_KHZ[calIdx] / 1000.0f;
+        retune(f);
+        lastHopMs = now;
+        Serial.printf("auto-cal: trying %.4f MHz (base %.3f %+0.1f kHz)\n",
+                      f, calBase, CAL_OFFS_KHZ[calIdx]);
+    }
+}
 
 // RSSI scan 
 static void doScan(const ScanRequest &req) {
@@ -812,7 +901,14 @@ function setRX(on,freq){
   p.textContent=on?'RX':'IDLE'; p.className='pill '+(on?'on':'off');
   if(freq) document.getElementById('hdr-freq').textContent=parseFloat(freq).toFixed(3)+' MHz';
 }
-function applyStatus(s){setRX(s.decoding,s.freq);}
+function applyStatus(s){
+  setRX(s.decoding,s.freq);
+  var p=document.getElementById('rx-pill');
+  if(s.decoding){
+    if(s.locked){p.textContent='LOCK';p.className='pill on';}
+    else{p.textContent='SEARCH';p.className='pill off';}
+  }
+}
 
 function startRX(){
   var f=parseFloat(document.getElementById('freq').value);
@@ -1054,13 +1150,16 @@ void handleStopRX() {
 }
 
 void handleStatus() {
-    char buf[200];
+    char buf[220];
     snprintf(buf, sizeof(buf),
-        "{\"type\":\"status\",\"decoding\":%s,\"freq\":%.3f,\"frames\":%d,\"scanning\":%s}",
+        "{\"type\":\"status\",\"decoding\":%s,\"freq\":%.3f,\"frames\":%d,"
+        "\"scanning\":%s,\"locked\":%s,\"inv\":%s}",
         rxActive    ? "true" : "false",
         rxFreq,
         frame_total,
-        scanRunning ? "true" : "false");
+        scanRunning ? "true" : "false",
+        (rxActive && !autoCal) ? "true" : "false",
+        lastInvert  ? "true" : "false");
     server.send(200, "application/json", buf);
 }
 
@@ -1152,6 +1251,8 @@ void loop() {
         scanRequested = false;
         doScan(pendingScan);
     }
+
+    service_autocal();
 
     // Push newly decoded frames over SSE
     if (frame_total > last_pushed) {
